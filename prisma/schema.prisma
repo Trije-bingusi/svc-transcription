@@ -1,0 +1,50 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Transcription {
+  id            String   @id @default(uuid()) @db.Uuid
+  lecture_id    String   @db.Uuid
+  video_url     String   @db.Text
+  
+  // Transcription metadata
+  language      String   @default("en-US")
+  status        String   @default("pending") // pending, processing, completed, failed
+  
+  // Azure Speech Services
+  azure_job_id  String?  @unique
+  
+  // Transcription content
+  transcript    String?  @db.Text
+  
+  // Word-level timing (stored as JSON)
+  // Format: [{ word: "hello", start: 1.2, end: 1.5, confidence: 0.98 }, ...]
+  word_timings  Json?
+  
+  // VTT/SRT subtitle formats
+  vtt_content   String?  @db.Text
+  srt_content   String?  @db.Text
+  
+  // Error information
+  error_message String?  @db.Text
+  
+  // Metadata
+  duration      Int?     // duration in seconds
+  confidence    Float?   // average confidence score
+  
+  created_at    DateTime @default(now()) @db.Timestamptz(6)
+  updated_at    DateTime @updatedAt @db.Timestamptz(6)
+  completed_at  DateTime? @db.Timestamptz(6)
+  
+  @@index([lecture_id])
+  @@index([status])
+  @@index([azure_job_id])
+}
