@@ -364,11 +364,11 @@ To integrate this service into the main platform:
 
 ## Integration with Video Upload Service
 
-The transcription service works together with `svc-video-upload`:
+The transcription service works together with `svc-video`:
 
-1. User uploads a video via `svc-video-upload`
+1. User uploads a video via `svc-video`
 2. Video is stored in Azure Blob Storage
-3. `svc-video-upload` returns a `blob_url`
+3. `svc-video` returns a `blob_url`
 4. Client calls `svc-transcription` with the `blob_url` to start transcription
 5. Transcription runs in the background
 6. Client polls for status or receives webhook notification when complete

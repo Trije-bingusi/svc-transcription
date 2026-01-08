@@ -29,12 +29,10 @@
   },
   "homepage": "https://github.com/Trije-bingusi/svc-transcription#readme",
   "dependencies": {
-    "@azure/ai-language-text": "^1.1.0",
     "@azure/storage-blob": "^12.25.0",
     "@prisma/client": "^6.17.1",
     "@scalar/express-api-reference": "^0.8.22",
     "express": "^5.1.0",
-    "microsoft-cognitiveservices-speech-sdk": "^1.40.0",
     "node-fetch": "^3.3.2",
     "pino-http": "^11.0.0",
     "prom-client": "^15.1.3",

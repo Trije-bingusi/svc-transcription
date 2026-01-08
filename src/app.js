@@ -4,8 +4,13 @@ import pinoHttp from "pino-http";
 import YAML from "yamljs";
 import { PrismaClient } from "@prisma/client";
 import { apiReference } from "@scalar/express-api-reference";
-import * as sdk from "microsoft-cognitiveservices-speech-sdk";
-import fetch from "node-fetch";
+import {
+  createBatchTranscription,
+  getTranscriptionStatus,
+  getTranscriptionFiles,
+  downloadTranscriptionResult,
+  parseTranscriptionResult,
+} from "./azureSpeech.js";
 
 function env(name, fallback) {
   const raw = process.env[name];
@@ -146,63 +151,64 @@ function formatTimeSRT(seconds) {
 }
 
 // Helper function to process transcription with Azure Speech Services
-async function transcribeWithAzure(videoUrl, language = "en-US") {
-  return new Promise((resolve, reject) => {
-    try {
-      const speechConfig = sdk.SpeechConfig.fromSubscription(
-        AZURE_SPEECH_KEY,
-        AZURE_SPEECH_REGION
-      );
-      speechConfig.speechRecognitionLanguage = language;
-      speechConfig.requestWordLevelTimestamps();
+async function transcribeWithAzure(videoUrl, language, transcriptionId) {
+  try {
+    // Create batch transcription job
+    const jobResult = await createBatchTranscription(
+      AZURE_SPEECH_KEY,
+      AZURE_SPEECH_REGION,
+      videoUrl,
+      language,
+      `Transcription-${transcriptionId}`
+    );
 
-      // For video URL, we need to download audio first or use Azure Batch Transcription API
-      // For simplicity, this example uses the simpler continuous recognition from audio
-      // In production, you'd want to use Azure Batch Transcription API for video files
+    const transcriptionUrl = jobResult.self;
+    
+    // Store the Azure job ID
+    await prisma.transcription.update({
+      where: { id: transcriptionId },
+      data: { azure_job_id: jobResult.id },
+    });
 
-      const audioConfig = sdk.AudioConfig.fromWavFileInput(videoUrl);
-      const recognizer = new sdk.SpeechRecognizer(speechConfig, audioConfig);
+    // Poll for completion (in production, use webhooks)
+    let status = "NotStarted";
+    let attempts = 0;
+    const maxAttempts = 120; // 10 minutes with 5-second intervals
 
-      let transcript = "";
-      let wordTimings = [];
+    while (status !== "Succeeded" && status !== "Failed" && attempts < maxAttempts) {
+      await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds
+      
+      const statusResult = await getTranscriptionStatus(AZURE_SPEECH_KEY, transcriptionUrl);
+      status = statusResult.status;
+      attempts++;
 
-      recognizer.recognized = (s, e) => {
-        if (e.result.reason === sdk.ResultReason.RecognizedSpeech) {
-          transcript += e.result.text + " ";
-          
-          // Extract word timings if available
-          const json = e.result.properties.getProperty(
-            sdk.PropertyId.SpeechServiceResponse_JsonResult
-          );
-          if (json) {
-            const result = JSON.parse(json);
-            if (result.NBest && result.NBest[0] && result.NBest[0].Words) {
-              wordTimings.push(...result.NBest[0].Words.map(w => ({
-                word: w.Word,
-                start: w.Offset / 10000000, // Convert to seconds
-                end: (w.Offset + w.Duration) / 10000000,
-                confidence: w.Confidence || 1.0,
-              })));
-            }
-          }
-        }
-      };
-
-      recognizer.canceled = (s, e) => {
-        recognizer.stopContinuousRecognitionAsync();
-        reject(new Error(`Recognition canceled: ${e.errorDetails}`));
-      };
-
-      recognizer.sessionStopped = () => {
-        recognizer.stopContinuousRecognitionAsync();
-        resolve({ transcript: transcript.trim(), wordTimings });
-      };
-
-      recognizer.startContinuousRecognitionAsync();
-    } catch (error) {
-      reject(error);
+      if (status === "Failed") {
+        throw new Error(statusResult.error?.message || "Transcription failed");
+      }
     }
-  });
+
+    if (status !== "Succeeded") {
+      throw new Error("Transcription timeout");
+    }
+
+    // Get transcription files
+    const filesResult = await getTranscriptionFiles(AZURE_SPEECH_KEY, transcriptionUrl);
+    
+    // Find the transcription result file
+    const resultFile = filesResult.values.find(f => f.kind === "Transcription");
+    if (!resultFile) {
+      throw new Error("No transcription result file found");
+    }
+
+    // Download and parse result
+    const azureResult = await downloadTranscriptionResult(AZURE_SPEECH_KEY, resultFile.links.contentUrl);
+    const { transcript, wordTimings, confidence } = parseTranscriptionResult(azureResult);
+
+    return { transcript, wordTimings, confidence };
+  } catch (error) {
+    console.error("Azure transcription error:", error);
+    throw error;
+  }
 }
 
 // Transcription endpoints
@@ -396,11 +402,7 @@ async function processTranscription(transcriptionId, videoUrl, language) {
     }
 
     // Actual Azure transcription
-    const result = await transcribeWithAzure(videoUrl, language);
-    
-    const avgConfidence = result.wordTimings.length > 0
-      ? result.wordTimings.reduce((sum, w) => sum + w.confidence, 0) / result.wordTimings.length
-      : null;
+    const result = await transcribeWithAzure(videoUrl, language, transcriptionId);
     
     const duration = result.wordTimings.length > 0
       ? Math.ceil(result.wordTimings[result.wordTimings.length - 1].end)
@@ -414,7 +416,7 @@ async function processTranscription(transcriptionId, videoUrl, language) {
         word_timings: result.wordTimings,
         vtt_content: generateVTT(result.wordTimings),
         srt_content: generateSRT(result.wordTimings),
-        confidence: avgConfidence,
+        confidence: result.confidence,
         duration,
         completed_at: new Date(),
       },
