@@ -1,38 +1,54 @@
 services:
-  svc-transcription:
+  api:
     build: .
     container_name: svc-transcription
-    ports:
-      - "3005:3000"
+    restart: unless-stopped
+    command: sh -c "npm run prisma:generate && npx prisma migrate deploy && npm start"
     environment:
-      PORT: 3000
-      DATABASE_URL: postgres://postgres:postgres@db:5432/transcription
-      
-      # Azure Speech Services (leave empty for local development)
-      AZURE_SPEECH_KEY: ${AZURE_SPEECH_KEY:-}
-      AZURE_SPEECH_REGION: ${AZURE_SPEECH_REGION:-}
+      PORT: ${PORT}
+      DATABASE_URL: ${DATABASE_URL}
+      NODE_ENV: ${NODE_ENV}
+
+      WHISPER_MODEL_ID: ${WHISPER_MODEL_ID}
+      DEFAULT_LANGUAGE: ${DEFAULT_LANGUAGE}
+      WORKER_ENABLED: ${WORKER_ENABLED}
+      WORKER_POLL_MS: ${WORKER_POLL_MS}
+
+      HF_HOME: ${HF_HOME}
+      TRANSFORMERS_CACHE: ${TRANSFORMERS_CACHE}
+      HF_HUB_DISABLE_TELEMETRY: ${HF_HUB_DISABLE_TELEMETRY}
+
     depends_on:
-      - db
-    networks:
-      - rso-network
+      db:
+        condition: service_healthy
+    ports:
+      - "3006:3000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   db:
-    image: postgres:16-alpine
-    container_name: transcription-db
+    image: postgres:16-alpine@sha256:7898d413578ff5fa67ce49233cc9743e282010eb2ec6ebf7834a63f4a60b05f0
+    container_name: svc-transcription-db
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: transcription
-    ports:
-      - "5434:5432"
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     volumes:
-      - transcription-db-data:/var/lib/postgresql/data
-    networks:
-      - rso-network
+      - db_data:/var/lib/postgresql/data
 
 volumes:
-  transcription-db-data:
-
-networks:
-  rso-network:
-    driver: bridge
+  db_data:
