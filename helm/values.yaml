@@ -1,0 +1,78 @@
+replicaCount: 1       # Number of desired pod replicas
+minReadySeconds: 10   # Minimum number of seconds a pod should be ready before being considered available
+
+containerPort: 3000   # Port on which the container listens.
+image: "<needs to be set>" # using --set flags during helm install/upgrade
+
+# Resource requests and limits for the container
+resources:
+  requests:
+    cpu: "250m"
+    memory: "1Gi"
+  limits:
+    cpu: "1"
+    memory: "2Gi"
+
+# Environment variables for the container
+env:
+  - name: PORT
+    value: "3000"
+
+  # Database
+  - name: DATABASE_BASE_URL
+    valueFrom:
+      secretKeyRef:
+        name: db-connection-url
+        key: DATABASE_BASE_URL
+  - name: DATABASE_URL
+    value: $(DATABASE_BASE_URL)/$(DB_NAME)?sslmode=require
+
+  # Transcription worker config
+  - name: PYTHON_BIN
+    value: "python3"
+  - name: TRANSCRIBE_SCRIPT
+    value: "src/transcribe.py"
+  - name: WHISPER_MODEL_ID
+    value: "small"
+  - name: WORKER_POLL_MS
+    value: "2000"
+
+
+# Service configuration for exposing the application
+service:
+  type: ClusterIP
+  port: 80
+
+# Service should not be directly exposed through Ingress, but through API Gateway
+ingress:
+  enabled: false
+  defaultHost: ""
+  className: nginx
+  tls:
+    enabled: false
+    secretName: nip-tls
+
+# Health check probes configuration
+probes:
+  liveness:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+
+  readiness:
+    enabled: true
+    path: /readyz
+    initialDelaySeconds: 20
+    periodSeconds: 5
+    timeoutSeconds: 6
+    failureThreshold: 6
+
+  startup:
+    enabled: true
+    path: /healthz
+    periodSeconds: 2
+    timeoutSeconds: 2
+    failureThreshold: 30

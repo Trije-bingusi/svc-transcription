@@ -1,0 +1,7 @@
+apiVersion: v2
+name: svc-transcription
+description: Service for managing transcriptions
+
+type: application
+version: 0.1.0
+appVersion: "vX.Y.Z"  # Overriden in CI/CD pipeline
