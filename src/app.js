@@ -4,78 +4,53 @@ import pinoHttp from "pino-http";
 import YAML from "yamljs";
 import { PrismaClient } from "@prisma/client";
 import { apiReference } from "@scalar/express-api-reference";
-import {
-  createBatchTranscription,
-  getTranscriptionStatus,
-  getTranscriptionFiles,
-  downloadTranscriptionResult,
-  parseTranscriptionResult,
-} from "./azureSpeech.js";
+import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 function env(name, fallback) {
   const raw = process.env[name];
-  if (raw === undefined || raw === null || raw === "") {
-    if (fallback === undefined) {
-      throw new Error(`Missing env: ${name}`);
-    }
+  if (!raw) {
+    if (fallback === undefined) throw new Error(`Missing env: ${name}`);
     return fallback;
   }
   return raw;
 }
 
 const PORT = Number(env("PORT", "3000"));
-const DATABASE_URL = env(
-  "DATABASE_URL",
-  "postgres://postgres:postgres@localhost:5432/transcription"
-);
+env("DATABASE_URL");
 
-// Azure Speech Services configuration
-const AZURE_SPEECH_KEY = env("AZURE_SPEECH_KEY", "");
-const AZURE_SPEECH_REGION = env("AZURE_SPEECH_REGION", "");
-const USE_AZURE_SPEECH = AZURE_SPEECH_KEY !== "" && AZURE_SPEECH_REGION !== "";
+const PYTHON_BIN = env("PYTHON_BIN", "python3"); 
+const TRANSCRIBE_SCRIPT = env("TRANSCRIBE_SCRIPT", "src/transcribe.py");
+const WHISPER_MODEL_ID = env("WHISPER_MODEL_ID", "small");
+const WORKER_POLL_MS = Number(env("WORKER_POLL_MS", "2000"));
 
 const prisma = new PrismaClient();
-
 const app = express();
 app.use(express.json());
-
-// Scalar API reference
-const openapi = YAML.load("./openapi.yaml");
-app.get("/openapi.json", (_req, res) => res.json(openapi));
-app.use(
-  "/docs",
-  apiReference({
-    spec: { url: "/openapi.json" },
-    theme: "default",
-    darkMode: true,
-  })
-);
-
 app.use(pinoHttp());
 
-// Prometheus metrics
+// Docs
+const openapi = YAML.load("./openapi.yaml");
+app.get("/docs/transcriptions/openapi.json", (_req, res) => res.json(openapi));
+app.use(
+  "/docs/transcriptions",
+  apiReference({ url: "/docs/transcriptions/openapi.json", theme: "default", darkMode: true })
+);
+
+// Metrics
 client.collectDefaultMetrics();
-const transcriptionCreatedCounter = new client.Counter({
-  name: "svc_transcription_job_created_total",
-  help: "Total number of transcription jobs created",
-});
-
-const transcriptionCompletedCounter = new client.Counter({
-  name: "svc_transcription_job_completed_total",
-  help: "Total number of transcription jobs completed",
-});
-
-const transcriptionFailedCounter = new client.Counter({
-  name: "svc_transcription_job_failed_total",
-  help: "Total number of transcription jobs failed",
-});
+const jobCreated = new client.Counter({ name: "svc_transcription_job_created_total", help: "Jobs created" });
+const jobDone = new client.Counter({ name: "svc_transcription_job_done_total", help: "Jobs done" });
+const jobFailed = new client.Counter({ name: "svc_transcription_job_failed_total", help: "Jobs failed" });
 
 app.get("/metrics", async (_req, res) => {
   res.set("Content-Type", client.register.contentType);
   res.end(await client.register.metrics());
 });
 
-// Health endpoints
+// Health
 app.get("/healthz", (_req, res) => res.send("OK"));
 app.get("/readyz", async (_req, res) => {
   try {
@@ -86,376 +61,259 @@ app.get("/readyz", async (_req, res) => {
   }
 });
 
-// Helper function to convert word timings to VTT format
-function generateVTT(wordTimings) {
-  if (!wordTimings || wordTimings.length === 0) {
-    return null;
-  }
-
-  let vtt = "WEBVTT\n\n";
-  
-  // Group words into cues (every 10 words or 5 seconds)
-  const cueLength = 10;
-  for (let i = 0; i < wordTimings.length; i += cueLength) {
-    const cueWords = wordTimings.slice(i, i + cueLength);
-    const start = cueWords[0].start;
-    const end = cueWords[cueWords.length - 1].end;
-    const text = cueWords.map(w => w.word).join(" ");
-    
-    vtt += `${formatTime(start)} --> ${formatTime(end)}\n`;
-    vtt += `${text}\n\n`;
-  }
-  
-  return vtt;
-}
-
-// Helper function to convert word timings to SRT format
-function generateSRT(wordTimings) {
-  if (!wordTimings || wordTimings.length === 0) {
-    return null;
-  }
-
-  let srt = "";
-  let cueIndex = 1;
-  
-  // Group words into cues (every 10 words or 5 seconds)
-  const cueLength = 10;
-  for (let i = 0; i < wordTimings.length; i += cueLength) {
-    const cueWords = wordTimings.slice(i, i + cueLength);
-    const start = cueWords[0].start;
-    const end = cueWords[cueWords.length - 1].end;
-    const text = cueWords.map(w => w.word).join(" ");
-    
-    srt += `${cueIndex}\n`;
-    srt += `${formatTimeSRT(start)} --> ${formatTimeSRT(end)}\n`;
-    srt += `${text}\n\n`;
-    cueIndex++;
-  }
-  
-  return srt;
-}
-
-// Format time for VTT (HH:MM:SS.mmm)
-function formatTime(seconds) {
-  const hrs = Math.floor(seconds / 3600);
-  const mins = Math.floor((seconds % 3600) / 60);
-  const secs = Math.floor(seconds % 60);
-  const ms = Math.floor((seconds % 1) * 1000);
-  
-  return `${hrs.toString().padStart(2, "0")}:${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}.${ms.toString().padStart(3, "0")}`;
-}
-
-// Format time for SRT (HH:MM:SS,mmm)
-function formatTimeSRT(seconds) {
-  return formatTime(seconds).replace(".", ",");
-}
-
-// Helper function to process transcription with Azure Speech Services
-async function transcribeWithAzure(videoUrl, language, transcriptionId) {
+// ---------- API ----------
+// POST /api/transcriptions
+// Body:
+// {
+//   lecture_id,
+//   video_url,                (SAS READ for download)
+//   video_blob_name,          (blob name, e.g. "abc.mp4")
+//   json_upload_url,          (SAS PUT to upload transcript json)
+//   vtt_upload_url,           (SAS PUT to upload transcript vtt)
+//   language?                 ("sl")
+// }
+// ---------- API ----------
+// POST /api/transcriptions
+app.post("/api/transcriptions", async (req, res, next) => {
   try {
-    // Create batch transcription job
-    const jobResult = await createBatchTranscription(
-      AZURE_SPEECH_KEY,
-      AZURE_SPEECH_REGION,
-      videoUrl,
-      language,
-      `Transcription-${transcriptionId}`
-    );
+    const {
+      lecture_id,
+      video_url,
+      video_blob_name,
+      json_upload_url,
+      vtt_upload_url,
+      language = "sl",
+    } = req.body || {};
 
-    const transcriptionUrl = jobResult.self;
-    
-    // Store the Azure job ID
-    await prisma.transcription.update({
-      where: { id: transcriptionId },
-      data: { azure_job_id: jobResult.id },
-    });
-
-    // Poll for completion (in production, use webhooks)
-    let status = "NotStarted";
-    let attempts = 0;
-    const maxAttempts = 120; // 10 minutes with 5-second intervals
-
-    while (status !== "Succeeded" && status !== "Failed" && attempts < maxAttempts) {
-      await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds
-      
-      const statusResult = await getTranscriptionStatus(AZURE_SPEECH_KEY, transcriptionUrl);
-      status = statusResult.status;
-      attempts++;
-
-      if (status === "Failed") {
-        throw new Error(statusResult.error?.message || "Transcription failed");
-      }
-    }
-
-    if (status !== "Succeeded") {
-      throw new Error("Transcription timeout");
-    }
-
-    // Get transcription files
-    const filesResult = await getTranscriptionFiles(AZURE_SPEECH_KEY, transcriptionUrl);
-    
-    // Find the transcription result file
-    const resultFile = filesResult.values.find(f => f.kind === "Transcription");
-    if (!resultFile) {
-      throw new Error("No transcription result file found");
-    }
-
-    // Download and parse result
-    const azureResult = await downloadTranscriptionResult(AZURE_SPEECH_KEY, resultFile.links.contentUrl);
-    const { transcript, wordTimings, confidence } = parseTranscriptionResult(azureResult);
-
-    return { transcript, wordTimings, confidence };
-  } catch (error) {
-    console.error("Azure transcription error:", error);
-    throw error;
-  }
-}
-
-// Transcription endpoints
-
-// Get all transcriptions for a lecture
-app.get("/api/lectures/:lectureId/transcriptions", async (req, res) => {
-  try {
-    const { lectureId } = req.params;
-    const transcriptions = await prisma.transcription.findMany({
-      where: { lecture_id: lectureId },
-      orderBy: { created_at: "desc" },
-      select: {
-        id: true,
-        lecture_id: true,
-        video_url: true,
-        language: true,
-        status: true,
-        confidence: true,
-        duration: true,
-        created_at: true,
-        updated_at: true,
-        completed_at: true,
-      },
-    });
-    res.json(transcriptions);
-  } catch (error) {
-    req.log.error(error, "Failed to fetch transcriptions");
-    res.status(500).json({ error: "Failed to fetch transcriptions" });
-  }
-});
-
-// Get specific transcription
-app.get("/api/transcriptions/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const transcription = await prisma.transcription.findUnique({
-      where: { id },
-    });
-    if (!transcription) {
-      return res.status(404).json({ error: "Transcription not found" });
-    }
-    res.json(transcription);
-  } catch (error) {
-    req.log.error(error, "Failed to fetch transcription");
-    res.status(500).json({ error: "Failed to fetch transcription" });
-  }
-});
-
-// Get transcript text only
-app.get("/api/transcriptions/:id/transcript", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const transcription = await prisma.transcription.findUnique({
-      where: { id },
-      select: { transcript: true, status: true },
-    });
-    if (!transcription) {
-      return res.status(404).json({ error: "Transcription not found" });
-    }
-    if (transcription.status !== "completed") {
-      return res.status(400).json({ error: "Transcription not yet completed" });
-    }
-    res.json({ transcript: transcription.transcript });
-  } catch (error) {
-    req.log.error(error, "Failed to fetch transcript");
-    res.status(500).json({ error: "Failed to fetch transcript" });
-  }
-});
-
-// Get VTT subtitles
-app.get("/api/transcriptions/:id/vtt", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const transcription = await prisma.transcription.findUnique({
-      where: { id },
-      select: { vtt_content: true, status: true },
-    });
-    if (!transcription) {
-      return res.status(404).json({ error: "Transcription not found" });
-    }
-    if (transcription.status !== "completed") {
-      return res.status(400).json({ error: "Transcription not yet completed" });
-    }
-    res.setHeader("Content-Type", "text/vtt");
-    res.send(transcription.vtt_content);
-  } catch (error) {
-    req.log.error(error, "Failed to fetch VTT");
-    res.status(500).json({ error: "Failed to fetch VTT" });
-  }
-});
-
-// Get SRT subtitles
-app.get("/api/transcriptions/:id/srt", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const transcription = await prisma.transcription.findUnique({
-      where: { id },
-      select: { srt_content: true, status: true },
-    });
-    if (!transcription) {
-      return res.status(404).json({ error: "Transcription not found" });
-    }
-    if (transcription.status !== "completed") {
-      return res.status(400).json({ error: "Transcription not yet completed" });
-    }
-    res.setHeader("Content-Type", "text/plain");
-    res.send(transcription.srt_content);
-  } catch (error) {
-    req.log.error(error, "Failed to fetch SRT");
-    res.status(500).json({ error: "Failed to fetch SRT" });
-  }
-});
-
-// Create new transcription job
-app.post("/api/lectures/:lectureId/transcribe", async (req, res) => {
-  try {
-    const { lectureId } = req.params;
-    const { video_url, language = "en-US" } = req.body;
-
-    if (!video_url) {
-      return res.status(400).json({ error: "video_url is required" });
-    }
-
-    // Create transcription record
-    const transcription = await prisma.transcription.create({
-      data: {
-        lecture_id: lectureId,
-        video_url,
-        language,
-        status: "pending",
-      },
-    });
-
-    transcriptionCreatedCounter.inc();
-
-    req.log.info(
-      { transcriptionId: transcription.id, lectureId, videoUrl: video_url },
-      "Transcription job created"
-    );
-
-    // Start async transcription (in production, this would be a background job)
-    processTranscription(transcription.id, video_url, language).catch((error) => {
-      console.error("Background transcription failed:", error);
-    });
-
-    res.status(201).json(transcription);
-  } catch (error) {
-    req.log.error(error, "Failed to create transcription job");
-    res.status(500).json({ error: "Failed to create transcription job" });
-  }
-});
-
-// Background transcription processor
-async function processTranscription(transcriptionId, videoUrl, language) {
-  try {
-    // Update status to processing
-    await prisma.transcription.update({
-      where: { id: transcriptionId },
-      data: { status: "processing" },
-    });
-
-    if (!USE_AZURE_SPEECH) {
-      // Mock transcription for local development
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-      
-      const mockTranscript = "This is a mock transcription for local development. Azure Speech Services is not configured.";
-      const mockWordTimings = [
-        { word: "This", start: 0.0, end: 0.3, confidence: 0.98 },
-        { word: "is", start: 0.3, end: 0.5, confidence: 0.99 },
-        { word: "a", start: 0.5, end: 0.6, confidence: 0.99 },
-        { word: "mock", start: 0.6, end: 0.9, confidence: 0.97 },
-        { word: "transcription", start: 0.9, end: 1.5, confidence: 0.96 },
-      ];
-
-      await prisma.transcription.update({
-        where: { id: transcriptionId },
-        data: {
-          status: "completed",
-          transcript: mockTranscript,
-          word_timings: mockWordTimings,
-          vtt_content: generateVTT(mockWordTimings),
-          srt_content: generateSRT(mockWordTimings),
-          confidence: 0.98,
-          duration: 120,
-          completed_at: new Date(),
-        },
+    if (!lecture_id || !video_url || !video_blob_name || !json_upload_url || !vtt_upload_url) {
+      return res.status(400).json({
+        error: "lecture_id, video_url, video_blob_name, json_upload_url, vtt_upload_url are required",
       });
-
-      transcriptionCompletedCounter.inc();
-      return;
     }
 
-    // Actual Azure transcription
-    const result = await transcribeWithAzure(videoUrl, language, transcriptionId);
-    
-    const duration = result.wordTimings.length > 0
-      ? Math.ceil(result.wordTimings[result.wordTimings.length - 1].end)
-      : null;
+    const existing = await prisma.transcriptionJob.findFirst({
+      where: { video_blob_name },
+      orderBy: { created_at: "desc" },
+      select: { id: true, status: true },
+    });
+    if (existing) {
+      return res.status(202).json({ job_id: existing.id, status: existing.status });
+    }
 
-    await prisma.transcription.update({
-      where: { id: transcriptionId },
+    const base = video_blob_name.replace(/\.[^.]+$/, "");
+    const jsonBlob = base + ".json";
+    const vttBlob = base + ".vtt";
+
+    const job = await prisma.transcriptionJob.create({
       data: {
-        status: "completed",
-        transcript: result.transcript,
-        word_timings: result.wordTimings,
-        vtt_content: generateVTT(result.wordTimings),
-        srt_content: generateSRT(result.wordTimings),
-        confidence: result.confidence,
-        duration,
-        completed_at: new Date(),
+        lecture_id,
+        video_url,
+        video_blob_name,
+        status: "queued",
+        language,
+        transcript_json_blob: jsonBlob,
+        transcript_vtt_blob: vttBlob,
+        transcript_json_url: json_upload_url,
+        transcript_vtt_url: vtt_upload_url,
       },
+      select: { id: true, status: true },
     });
 
-    transcriptionCompletedCounter.inc();
-  } catch (error) {
-    console.error("Transcription processing error:", error);
-    
-    await prisma.transcription.update({
-      where: { id: transcriptionId },
-      data: {
-        status: "failed",
-        error_message: error.message,
-      },
+    jobCreated.inc();
+    res.status(202).json({ job_id: job.id, status: job.status });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/transcriptions/:jobId
+app.get("/api/transcriptions/:jobId", async (req, res, next) => {
+  try {
+    const job = await prisma.transcriptionJob.findUnique({ where: { id: req.params.jobId } });
+    if (!job) return res.status(404).json({ error: "Not found" });
+
+    res.json({
+      job_id: job.id,
+      lecture_id: job.lecture_id,
+      status: job.status,
+      error: job.status === "failed" ? job.error : undefined,
+
+      transcript_json_blob: job.status === "done" ? job.transcript_json_blob : undefined,
+      transcript_vtt_blob: job.status === "done" ? job.transcript_vtt_blob : undefined,
+
+      video_blob_name: job.video_blob_name
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Worker
+let busy = false;
+
+function run(cmd, args) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+
+    let out = "";
+    let err = "";
+
+    p.stdout.on("data", (d) => (out += d.toString()));
+    p.stderr.on("data", (d) => (err += d.toString()));
+
+    p.on("close", (code) => {
+      if (code === 0) return resolve({ out, err });
+
+      reject(
+        new Error(
+          `Command failed: ${cmd} ${args.join(" ")}\n` +
+          `exit=${code}\n` +
+          (out ? `--- stdout ---\n${out}\n` : "") +
+          (err ? `--- stderr ---\n${err}\n` : "")
+        )
+      );
+    });
+  });
+}
+
+async function processOneJob() {
+  if (busy) return;
+  busy = true;
+
+  let currentJobId = null;
+
+  const must = (name, v, jobId) => {
+    const s = (v ?? "").toString();
+    if (!s.trim()) throw new Error(`Missing ${name} on job ${jobId}`);
+    return s.trim();
+  };
+
+  try {
+    const job = await prisma.transcriptionJob.findFirst({
+      where: { status: "queued" },
+      orderBy: { created_at: "asc" },
+    });
+    if (!job) return;
+
+    currentJobId = job.id;
+
+    // Validate/sanitize URLs
+    const videoUrl = must("video_url", job.video_url, job.id);
+    const jsonUrl = must("transcript_json_url", job.transcript_json_url, job.id);
+    const vttUrl = must("transcript_vtt_url", job.transcript_vtt_url, job.id);
+
+    await prisma.transcriptionJob.update({
+      where: { id: job.id },
+      data: { status: "processing", started_at: new Date() },
     });
 
-    transcriptionFailedCounter.inc();
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "tx-"));
+    const videoPath = path.join(tmpDir, "video");
+    const wavPath = path.join(tmpDir, "audio.wav");
+    const outJson = path.join(tmpDir, "transcript.json");
+    const outVtt = path.join(tmpDir, "transcript.vtt");
+
+    await run("curl", ["-L", "--fail", "-o", videoPath, videoUrl]);
+
+    await run("ffmpeg", [
+      "-y",
+      "-i",
+      videoPath,
+      "-vn",
+      "-ac",
+      "1",
+      "-ar",
+      "16000",
+      "-c:a",
+      "pcm_s16le",
+      wavPath,
+    ]);
+
+    await run(PYTHON_BIN, [
+      TRANSCRIBE_SCRIPT,
+      "--model",
+      WHISPER_MODEL_ID,
+      "--language",
+      job.language || "sl",
+      "--input_wav",
+      wavPath,
+      "--out_json",
+      outJson,
+      "--out_vtt",
+      outVtt,
+      "--compute_type",
+      "int8",
+      "--beam_size",
+      "1",
+      "--vad_filter",
+      "--max_segment_s",
+      "6",
+    ]);
+
+    await run("curl", [
+      "-X",
+      "PUT",
+      "-T",
+      outJson,
+      "-H",
+      "x-ms-blob-type: BlockBlob",
+      "-H",
+      "Content-Type: application/json",
+      "--fail",
+      jsonUrl,
+    ]);
+
+    await run("curl", [
+      "-X",
+      "PUT",
+      "-T",
+      outVtt,
+      "-H",
+      "x-ms-blob-type: BlockBlob",
+      "-H",
+      "Content-Type: text/vtt",
+      "--fail",
+      vttUrl,
+    ]);
+
+    await prisma.transcriptionJob.update({
+      where: { id: job.id },
+      data: { status: "done", completed_at: new Date(), error: null },
+    });
+
+    jobDone.inc();
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  } catch (e) {
+    console.error("Job failed:", e);
+    if (currentJobId) {
+      await prisma.transcriptionJob.update({
+        where: { id: currentJobId },
+        data: { status: "failed", completed_at: new Date(), error: String(e?.message || e) },
+      });
+      jobFailed.inc();
+    }
+  } finally {
+    busy = false;
   }
 }
 
-// Delete transcription
-app.delete("/api/transcriptions/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
+setInterval(processOneJob, WORKER_POLL_MS).unref();
 
-    await prisma.transcription.delete({
-      where: { id },
-    });
-
-    res.json({ message: "Transcription deleted successfully" });
-  } catch (error) {
-    req.log.error(error, "Failed to delete transcription");
-    res.status(500).json({ error: "Failed to delete transcription" });
-  }
+// Error handling
+app.use((err, _req, res, _next) => {
+  console.error(err);
+  res.status(500).json({ error: "Internal server error" });
 });
 
-app.listen(PORT, () => {
-  console.log(`svc-transcription listening on port ${PORT}`);
-  console.log(`API docs available at http://localhost:${PORT}/docs`);
-  console.log(`Azure Speech Services: ${USE_AZURE_SPEECH ? "enabled" : "disabled (mock mode)"}`);
-});
+// Start + graceful shutdown
+const server = app.listen(PORT, () => console.log("Transcription service listening on port", PORT));
+function shutdown() {
+  console.log("Shutting down server...");
+  server.close(async () => {
+    try { await prisma.$disconnect(); }
+    finally { process.exit(0); }
+  });
+  setTimeout(() => process.exit(1), 10_000).unref();
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
