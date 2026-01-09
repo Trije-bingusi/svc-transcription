@@ -1,7 +1,0 @@
-node_modules/
-.env
-*.log
-dist/
-build/
-.DS_Store
-temp/
