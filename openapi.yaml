@@ -1,0 +1,143 @@
+openapi: 3.0.3
+info:
+  title: Transcription Service
+  version: 1.0.0
+servers:
+  - url: /
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      responses:
+        "200":
+          description: OK
+
+  /readyz:
+    get:
+      summary: Readiness probe
+      responses:
+        "200":
+          description: READY
+        "500":
+          description: NOT READY
+
+  /api/transcriptions:
+    post:
+      summary: Create a transcription job (async)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTranscriptionRequest"
+      responses:
+        "202":
+          description: Job queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateTranscriptionResponse"
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/transcriptions/{jobId}:
+    get:
+      summary: Get transcription job status
+      parameters:
+        - in: path
+          name: jobId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Job status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobStatusResponse"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  schemas:
+    CreateTranscriptionRequest:
+      type: object
+      required:
+        - lecture_id
+        - video_url
+        - json_upload_url
+        - vtt_upload_url
+      properties:
+        lecture_id:
+          type: string
+          format: uuid
+          description: Lecture ID the video belongs to
+        video_url:
+          type: string
+          format: uri
+          description: SAS read URL to the uploaded video blob (mp4, etc.)
+        json_upload_url:
+          type: string
+          format: uri
+          description: SAS PUT URL (write) for uploading transcript JSON to Blob
+        vtt_upload_url:
+          type: string
+          format: uri
+          description: SAS PUT URL (write) for uploading transcript VTT to Blob
+        language:
+          type: string
+          description: Language code (default sl)
+          example: sl
+
+    CreateTranscriptionResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [queued]
+
+    JobStatusResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        lecture_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [queued, processing, done, failed]
+        error:
+          type: string
+          nullable: true
+          description: Present only when status=failed
+        transcript_json_url:
+          type: string
+          format: uri
+          nullable: true
+          description: Present only when status=done (currently stored URL)
+        transcript_vtt_url:
+          type: string
+          format: uri
+          nullable: true
+          description: Present only when status=done (currently stored URL)
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string

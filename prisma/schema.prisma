@@ -1,0 +1,40 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model TranscriptionJob {
+  id          String   @id @default(uuid()) @db.Uuid
+
+  lecture_id  String   @db.Uuid
+
+  // SAS READ URL to download the video for transcription
+  video_url   String   @db.Text
+
+  // Stable blob name/path for the uploaded video.
+  video_blob_name String @db.Text
+
+  status      String   @default("queued") // queued | processing | done | failed
+  language    String   @default("sl")
+
+  error       String?  @db.Text
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+  started_at  DateTime? @db.Timestamptz(6)
+  completed_at DateTime? @db.Timestamptz(6)
+
+  // Stable output blob names (permanent identifiers)
+  transcript_json_blob String? @db.Text
+  transcript_vtt_blob  String? @db.Text
+
+  transcript_json_url String? @db.Text
+  transcript_vtt_url  String? @db.Text
+
+  user_id     String?  @db.Uuid
+
+  @@index([lecture_id])
+  @@index([video_blob_name])
+}
