@@ -285,9 +285,11 @@ async function processOneJob() {
     // Publish message to NATS about completed transcription
     try {
       const vttSasUrl = await generateSasUrl(blobServiceClient, AZURE_STORAGE_CONTAINER_NAME, job.transcript_vtt_blob);
+      const jsonSasUrl = await generateSasUrl(blobServiceClient, AZURE_STORAGE_CONTAINER_NAME, job.transcript_json_blob);
       await publishJson("transcriptions.completed", {
         lecture_id: job.lecture_id,
-        transcription_vtt_url: vttSasUrl
+        transcription_vtt_url: vttSasUrl,
+        transcription_json_url: jsonSasUrl
       });
     } catch (e) {
       logger.warn(e, `Failed to publish transcription completed message for job ${job.id}`);
