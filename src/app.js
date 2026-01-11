@@ -1,13 +1,16 @@
 import express from "express";
 import client from "prom-client";
-import pinoHttp from "pino-http";
 import YAML from "yamljs";
 import { PrismaClient } from "@prisma/client";
 import { apiReference } from "@scalar/express-api-reference";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { logger, httpLogger } from "./logging.js";
+import { publishJson } from "./mq.js";
+import { initializeBlobServiceClient, uploadBlob, generateSasUrl } from "./azureStorage.js";
 
 function env(name, fallback) {
   const raw = process.env[name];
@@ -26,10 +29,14 @@ const TRANSCRIBE_SCRIPT = env("TRANSCRIBE_SCRIPT", "src/transcribe.py");
 const WHISPER_MODEL_ID = env("WHISPER_MODEL_ID", "small");
 const WORKER_POLL_MS = Number(env("WORKER_POLL_MS", "2000"));
 
+const AZURE_STORAGE_ACCOUNT_NAME = env("AZURE_STORAGE_ACCOUNT_NAME");
+const AZURE_STORAGE_CONTAINER_NAME = env("AZURE_STORAGE_CONTAINER_NAME");
+const blobServiceClient = initializeBlobServiceClient(AZURE_STORAGE_ACCOUNT_NAME);
+
 const prisma = new PrismaClient();
 const app = express();
 app.use(express.json());
-app.use(pinoHttp());
+app.use(httpLogger);
 
 // Docs
 const openapi = YAML.load("./openapi.yaml");
@@ -80,14 +87,12 @@ app.post("/api/transcriptions", async (req, res, next) => {
       lecture_id,
       video_url,
       video_blob_name,
-      json_upload_url,
-      vtt_upload_url,
       language = "sl",
     } = req.body || {};
 
-    if (!lecture_id || !video_url || !video_blob_name || !json_upload_url || !vtt_upload_url) {
+    if (!lecture_id || !video_url || !video_blob_name) {
       return res.status(400).json({
-        error: "lecture_id, video_url, video_blob_name, json_upload_url, vtt_upload_url are required",
+        error: "lecture_id, video_url, video_blob_name are required",
       });
     }
 
@@ -100,7 +105,7 @@ app.post("/api/transcriptions", async (req, res, next) => {
       return res.status(202).json({ job_id: existing.id, status: existing.status });
     }
 
-    const base = video_blob_name.replace(/\.[^.]+$/, "");
+    const base = randomUUID();
     const jsonBlob = base + ".json";
     const vttBlob = base + ".vtt";
 
@@ -112,9 +117,7 @@ app.post("/api/transcriptions", async (req, res, next) => {
         status: "queued",
         language,
         transcript_json_blob: jsonBlob,
-        transcript_vtt_blob: vttBlob,
-        transcript_json_url: json_upload_url,
-        transcript_vtt_url: vtt_upload_url,
+        transcript_vtt_blob: vttBlob
       },
       select: { id: true, status: true },
     });
@@ -143,6 +146,29 @@ app.get("/api/transcriptions/:jobId", async (req, res, next) => {
 
       video_blob_name: job.video_blob_name
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET transcription for a lecture
+app.get("/api/lectures/:lectureId/transcription", async (req, res, next) => {
+  try {
+    const lectureId = req.params.lectureId;
+    const job = await prisma.transcriptionJob.findFirst({
+      where: { lecture_id: lectureId, status: "done" },
+      orderBy: { completed_at: "desc" },
+    });
+    if (!job) return res.status(404).json({ error: "Not found" });
+
+    const sasUrlJson = await generateSasUrl(blobServiceClient, AZURE_STORAGE_CONTAINER_NAME, job.transcript_json_blob);
+    const sasUrlVtt = await generateSasUrl(blobServiceClient, AZURE_STORAGE_CONTAINER_NAME, job.transcript_vtt_blob);
+
+    res.json({
+      transcript_json_url: sasUrlJson,
+      transcript_vtt_url: sasUrlVtt,
+    });
+
   } catch (err) {
     next(err);
   }
@@ -199,8 +225,6 @@ async function processOneJob() {
 
     // Validate/sanitize URLs
     const videoUrl = must("video_url", job.video_url, job.id);
-    const jsonUrl = must("transcript_json_url", job.transcript_json_url, job.id);
-    const vttUrl = must("transcript_vtt_url", job.transcript_vtt_url, job.id);
 
     await prisma.transcriptionJob.update({
       where: { id: job.id },
@@ -250,41 +274,31 @@ async function processOneJob() {
       "6",
     ]);
 
-    await run("curl", [
-      "-X",
-      "PUT",
-      "-T",
-      outJson,
-      "-H",
-      "x-ms-blob-type: BlockBlob",
-      "-H",
-      "Content-Type: application/json",
-      "--fail",
-      jsonUrl,
-    ]);
-
-    await run("curl", [
-      "-X",
-      "PUT",
-      "-T",
-      outVtt,
-      "-H",
-      "x-ms-blob-type: BlockBlob",
-      "-H",
-      "Content-Type: text/vtt",
-      "--fail",
-      vttUrl,
-    ]);
-
+    await uploadBlob(blobServiceClient, AZURE_STORAGE_CONTAINER_NAME, job.transcript_json_blob, await fs.readFile(outJson), "application/json");
+    await uploadBlob(blobServiceClient, AZURE_STORAGE_CONTAINER_NAME, job.transcript_vtt_blob, await fs.readFile(outVtt), "text/vtt");
+    
     await prisma.transcriptionJob.update({
       where: { id: job.id },
       data: { status: "done", completed_at: new Date(), error: null },
     });
 
+    // Publish message to NATS about completed transcription
+    try {
+      const vttSasUrl = await generateSasUrl(blobServiceClient, AZURE_STORAGE_CONTAINER_NAME, job.transcript_vtt_blob);
+      const jsonSasUrl = await generateSasUrl(blobServiceClient, AZURE_STORAGE_CONTAINER_NAME, job.transcript_json_blob);
+      await publishJson("transcriptions.completed", {
+        lecture_id: job.lecture_id,
+        transcription_vtt_url: vttSasUrl,
+        transcription_json_url: jsonSasUrl
+      });
+    } catch (e) {
+      logger.warn(e, `Failed to publish transcription completed message for job ${job.id}`);
+    }
+
     jobDone.inc();
     await fs.rm(tmpDir, { recursive: true, force: true });
   } catch (e) {
-    console.error("Job failed:", e);
+    logger.error(e, "Job failed");
     if (currentJobId) {
       await prisma.transcriptionJob.update({
         where: { id: currentJobId },
@@ -301,7 +315,7 @@ setInterval(processOneJob, WORKER_POLL_MS).unref();
 
 // Error handling
 app.use((err, _req, res, _next) => {
-  console.error(err);
+  logger.error(err, "Internal server error");
   res.status(500).json({ error: "Internal server error" });
 });
 
