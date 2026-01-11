@@ -9,6 +9,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { logger, httpLogger } from "./logging.js";
+import { publishJson } from "./mq.js";
 import { initializeBlobServiceClient, uploadBlob, generateSasUrl } from "./azureStorage.js";
 
 function env(name, fallback) {
@@ -280,6 +281,17 @@ async function processOneJob() {
       where: { id: job.id },
       data: { status: "done", completed_at: new Date(), error: null },
     });
+
+    // Publish message to NATS about completed transcription
+    try {
+      const vttSasUrl = await generateSasUrl(blobServiceClient, AZURE_STORAGE_CONTAINER_NAME, job.transcript_vtt_blob);
+      await publishJson("transcriptions.completed", {
+        lecture_id: job.lecture_id,
+        transcription_vtt_url: vttSasUrl
+      });
+    } catch (e) {
+      logger.warn(e, `Failed to publish transcription completed message for job ${job.id}`);
+    }
 
     jobDone.inc();
     await fs.rm(tmpDir, { recursive: true, force: true });

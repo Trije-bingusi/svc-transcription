@@ -40,7 +40,8 @@ env:
     value: videosbingusi
   - name: AZURE_STORAGE_CONTAINER_NAME
     value: videos
-
+  - name: NATS_URL
+    value: "http://nats.nats.svc.cluster.local:4222"
 
 # Service configuration for exposing the application
 service:
