@@ -36,6 +36,10 @@ env:
     value: "small"
   - name: WORKER_POLL_MS
     value: "2000"
+  - name: AZURE_STORAGE_ACCOUNT_NAME
+    value: videosbingusi
+  - name: AZURE_STORAGE_CONTAINER_NAME
+    value: videos
 
 
 # Service configuration for exposing the application
